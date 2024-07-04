@@ -57,18 +57,14 @@ async def test_code(agent: Agent, task_id: str, project_path: str) -> str:
     output_type="str",
 )
 async def generate_solana_code(agent: Agent, task_id: str, specification: str) -> str:
+    global ERROR_INFO
 
     prompt_engine = PromptEngine("gpt-4o")
-    lib_prompt = prompt_engine.load_prompt(
-        "anchor-lib", specification=specification)
-    instructions_prompt = prompt_engine.load_prompt(
-        "anchor-instructions", specification=specification)
-    errors_prompt = prompt_engine.load_prompt(
-        "anchor-errors", specification=specification)
-    cargo_toml_prompt = prompt_engine.load_prompt(
-        "anchor-cargo-toml", specification=specification)
-    anchor_toml_prompt = prompt_engine.load_prompt(
-        "anchor-anchor-toml", specification=specification)
+    lib_prompt = prompt_engine.load_prompt("anchor-lib", specification=specification, error_info=ERROR_INFO)
+    instructions_prompt = prompt_engine.load_prompt("anchor-instructions", specification=specification, error_info=ERROR_INFO)
+    errors_prompt = prompt_engine.load_prompt("anchor-errors", specification=specification, error_info=ERROR_INFO)
+    cargo_toml_prompt = prompt_engine.load_prompt("anchor-cargo-toml", specification=specification, error_info=ERROR_INFO)
+    anchor_toml_prompt = prompt_engine.load_prompt("anchor-anchor-toml", specification=specification, error_info=ERROR_INFO)
 
     messages = [
         {"role": "system", "content": "You are a code generation assistant specialized in Anchor for Solana."},
@@ -77,7 +73,7 @@ async def generate_solana_code(agent: Agent, task_id: str, specification: str) -
         {"role": "user", "content": errors_prompt},
         {"role": "user", "content": cargo_toml_prompt},
         {"role": "user", "content": anchor_toml_prompt},
-        {"role": "user", "content": "Return the whole code as a string with the file markers intact that you received in each of the input without changing their wording at all."}
+        {"role": "user", "content": "Return the whole code as a string with the file markers intact that you received in each of the input without changing their wording at all and use *filename* before each file's content."}
     ]
 
     chat_completion_kwargs = {
@@ -96,46 +92,79 @@ async def generate_solana_code(agent: Agent, task_id: str, specification: str) -
         LOG.error(f"Error parsing response content: {e}")
         return "Failed to generate Solana on-chain code due to response parsing error."
 
-    base_path = agent.workspace.base_path if isinstance(
-        agent.workspace, LocalWorkspace) else str(agent.workspace.base_path)
+    base_path = agent.workspace.base_path if isinstance(agent.workspace, LocalWorkspace) else str(agent.workspace.base_path)
     project_path = os.path.join(base_path, task_id)
     LOG.info(f"Base path: {base_path}")
     LOG.info(f"Project path: {project_path}")
-    cargo_toml_content = """
-    [package]
-    name = "my_anchor_program"
-    version = "0.1.0"
-    edition = "2018"
-
-    [dependencies]
-    anchor-lang = "0.30.1"
-    """
 
     LOG.info(f"id: {task_id}")
     LOG.info(f"Parts: {response_content}")
-    await agent.abilities.run_action(
-        task_id, "write_file", file_path=os.path.join(project_path, 'src', 'lib.rs'), data=parts['anchor-lib.rs'].encode()
-    )
-    await agent.abilities.run_action(
-        task_id, "write_file", file_path=os.path.join(project_path, 'src', 'instructions.rs'), data=parts['anchor-instructions.rs'].encode()
-    )
-    await agent.abilities.run_action(
-        task_id, "write_file", file_path=os.path.join(project_path, 'src', 'errors.rs'), data=parts['errors.rs'].encode()
-    )
-    await agent.abilities.run_action(
-        task_id, "write_file", file_path=os.path.join(project_path, 'Cargo.toml'), data=cargo_toml_content.encode()
-    )
-    await agent.abilities.run_action(
-        task_id, "write_file", file_path=os.path.join(project_path, 'Anchor.toml'), data=parts['Anchor.toml'].encode()
-    )
+
+    # Ensure Cargo.toml is written first
+    cargo_file_path = os.path.join(project_path, 'Cargo.toml')
+    await agent.abilities.run_action(task_id, "write_file", file_path=cargo_file_path, data=ARGO_TOML_CONTENT.encode())
+    LOG.info(f"Cargo.toml generated successfully.")
+
+    # Ensure Anchor.toml is written first
+    anchor_file_path = os.path.join(project_path, 'Anchor.toml')
+    await agent.abilities.run_action(task_id, "write_file", file_path=anchor_file_path, data=ANCHOR_TOML_CONTENT.encode())
+    LOG.info(f"Anchor.toml generated successfully.")
+
+
+        
+    file_actions = [
+        ('src/lib.rs', parts['anchor-lib.rs']),
+        ('src/instructions.rs', parts['anchor-instructions.rs']),
+        ('src/errors.rs', parts['errors.rs']),
+    ]
+    # Check if all files have a valid .rs extension for any additional files
+    for file_path, file_content in parts.items():
+        if not file_path.endswith(".rs"):
+            LOG.error(f"File {file_path} does not have a valid .rs extension.")
+            continue
+
+    for file_path, file_content in file_actions:
+        full_file_path = os.path.join(project_path, file_path)
+        
+        if os.path.exists(full_file_path):
+            LOG.info(f"{file_path} already exists. Skipping regeneration.")
+        else:
+            LOG.info(f"Generating {file_path}. Press 'y' to continue...")
+            if input().strip().lower() != 'y':
+                return f"Generation halted by user at {file_path}."
+            
+            await agent.abilities.run_action(task_id, "write_file", file_path=full_file_path, data=file_content.encode())
+            LOG.info(f"{file_path} generated successfully.")
+
+            # Compile the generated file
+            compile_result = await compile_file(agent, task_id, project_path, file_path)
+            if "error" in compile_result.lower():
+                LOG.error(f"Compilation failed for {file_path}: {compile_result}")
+                LOG.info(f"Compilation failed for {file_path}, regenerating...")
+                
+                # Update ERROR_INFO with the compilation error
+                ERROR_INFO = compile_result
+                
+                # Regenerate only the faulty file
+                return await generate_solana_code(agent, task_id, specification)
+
     test_result = await agent.abilities.run_action(task_id, "test_code", project_path=project_path)
     if "All tests passed" not in test_result:
-        # Regenerate the code based on errors
         LOG.info(f"Regenerating code due to errors: {test_result}")
+        ERROR_INFO = test_result  # Update ERROR_INFO with the test error
         return await generate_solana_code(agent, task_id, specification)
 
     return "Solana on-chain code generated, tested, and verified successfully."
 
+
+async def compile_file(agent: Agent, task_id: str, project_path: str, file_path: str) -> str:
+    try:
+        result = subprocess.run(['cargo', 'check', '--release'], cwd=project_path, capture_output=True, text=True)
+        if result.returncode != 0:
+            return result.stderr
+        return "Compilation successful."
+    except Exception as e:
+        return f"Compilation failed: {e}"
 
 @action(
     name="generate_frontend_code",
